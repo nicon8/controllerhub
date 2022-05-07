@@ -8,6 +8,17 @@ from threading import Thread,Timer
 import pandas as pd
 import os
 from os import path
+import RPi.GPIO as GPIO
+
+data = pd.DataFrame()
+status = 0
+pin = 12
+
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(pin,GPIO.OUT)
+pi_pwm = GPIO.PWM(pin,1000)
+pi_pwm.start(0)
 
 def get_value(server,device="SDM1.1",avg=True):
   if avg:
@@ -21,6 +32,7 @@ def get_value(server,device="SDM1.1",avg=True):
 
 
 def write_values(prod,cons,outfile):
+    global data
     record = {}
     date = dateutil.parser.parse(prod["Timestamp"])
     outf = (outfile+"_"+str(date.year)+"-"+str(date.month)+"-"+str(date.day)+".xlsx")
@@ -32,21 +44,22 @@ def write_values(prod,cons,outfile):
     record["C Curr (A)"] = [cons["CurrentL1"]]
     record["C Power (W)"] = [cons["PowerL1"]]
     row = pd.DataFrame(record)
-    #date = datetime.strptime(prod["Timestamp"], '%Y-%m-%dT%H::%M::%S.%f')
-    #row.to_csv(outf, mode='a', header=not os.path.exists(outf))
-    if path.exists(outf):
-        with pd.ExcelWriter(outf, mode="a",if_sheet_exists="overlay") as writer:
-            row.to_excel(writer,header=False)
-    else:
-        with pd.ExcelWriter(outf, mode="w") as writer:
-            row.to_excel(writer)
+    data = pd.concat([data,row])
+    data.to_excel(outf)
     return True
 
 def act(todo,saving):
+    global status
+    global pi_pwm
     if todo:
-        pass
+        print("Poweron")
+        status = min(100, status + (saving / 200) )
     else:
-        pass
+        print("Reduction")
+        status = max(0,status + (saving / 200))
+
+    print(status)
+    pi_pwm.ChangeDutyCycle(status) 
     return True
 
 def on(saving):
@@ -56,23 +69,24 @@ def off(saving):
     return act(False,saving)
 
 def calculate(prod=0.0,cons=0.0,thresold=0):
-    saving = max(0,prod-cons)
-    print(prod,cons,saving)
+    global status
+    saving = prod-cons
+    print(prod,cons,saving,status)
     if saving > thresold:
-        return (on,saving)
+        return on(saving)
     else:
-        return (off,saving)
+        return off(saving)
 
 def elaborate(devprod,devcons,avg,thresold,interval,outfile,server):
     while True:
       prod = (get_value(server,devprod,avg))
       cons = (get_value(server,devcons,avg))
       write_values(prod,cons,outfile)
-      calculate(prod["PowerL1"],cons["PowerL1"],thresold=16.0)
+      calculate(prod["PowerL1"],cons["PowerL1"],thresold=400.0)
       time.sleep(interval)
 
 def main():
-    t = Thread(target=elaborate, args=("SDM1.2","SDM1.1",False,16.0,5,"misure","http://192.168.1.127:8080"))
+    t = Thread(target=elaborate, args=("SDM1.2","SDM1.1",False,16.0,5,"/home/pi/shared/misure","http://192.168.1.127:8080"))
     t.start() 
 
 if __name__ == "__main__":
