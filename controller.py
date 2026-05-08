@@ -2,6 +2,8 @@
 
 import csv
 import logging
+import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
@@ -29,6 +31,50 @@ class Config:
     request_timeout_s: float = 3.0
     watts_per_duty_step: float = 200.0
     max_duty_step: float = 5.0
+    notifications_enabled: bool = True
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_topic: str = "controller-caldaia-castellano"
+    ntfy_timeout_s: float = 3.0
+    notification_cooldown_s: float = 600.0
+    notify_after_failures: int = 3
+    limit_status_after_s: float = 300.0
+
+
+class Notifier:
+    def __init__(self, enabled, server, topic, timeout_s, cooldown_s):
+        self.enabled = enabled and bool(topic)
+        self.server = server.rstrip("/")
+        self.topic = topic
+        self.timeout_s = timeout_s
+        self.cooldown_s = cooldown_s
+        self._last_sent = {}
+
+    def send(self, key, title, message, priority=3, force=False):
+        if not self.enabled:
+            return False
+
+        now = time.monotonic()
+        last_sent = self._last_sent.get(key, 0.0)
+        if not force and now - last_sent < self.cooldown_s:
+            return False
+
+        try:
+            response = requests.post(
+                f"{self.server}/{self.topic}",
+                data=message.encode("utf-8"),
+                headers={
+                    "Title": title,
+                    "Priority": str(priority),
+                    "Tags": "warning" if priority >= 4 else "information_source",
+                },
+                timeout=self.timeout_s,
+            )
+            response.raise_for_status()
+            self._last_sent[key] = now
+            return True
+        except requests.RequestException as exc:
+            logging.warning("notifica ntfy non inviata: %s", exc)
+            return False
 
 
 class ValveController:
@@ -142,8 +188,40 @@ def calculate(prod=0.0, cons=0.0, threshold=0.0, controller=None):
     return controller.update(surplus, threshold)
 
 
-def elaborate(config, controller, stop_event=None):
+def notify_limit_status(config, notifier, controller, limit_since, limit_value):
+    if controller.status not in (0.0, 100.0):
+        return None, None
+
+    now = time.monotonic()
+    if limit_value != controller.status:
+        return now, controller.status
+
+    if limit_since is not None and now - limit_since >= config.limit_status_after_s:
+        notifier.send(
+            f"duty-limit-{int(controller.status)}",
+            "Controller caldaia: duty al limite",
+            f"PWM fermo a {controller.status:.0f}% da almeno "
+            f"{config.limit_status_after_s:.0f} secondi.",
+            priority=4,
+        )
+
+    return limit_since, limit_value
+
+
+def elaborate(config, controller, notifier, stop_event=None):
     stop_event = stop_event or Event()
+    consecutive_failures = 0
+    was_failing = False
+    limit_since = None
+    limit_value = None
+
+    notifier.send(
+        "startup",
+        "Controller caldaia avviato",
+        f"{socket.gethostname()} sta monitorando produzione e consumo.",
+        priority=2,
+        force=True,
+    )
 
     while not stop_event.is_set():
         try:
@@ -166,8 +244,36 @@ def elaborate(config, controller, stop_event=None):
                 threshold=config.control_deadband_w,
                 controller=controller,
             )
+
+            if was_failing:
+                notifier.send(
+                    "sensor-recovered",
+                    "Controller caldaia: sensori recuperati",
+                    "Le letture dei sensori sono tornate disponibili.",
+                    priority=3,
+                    force=True,
+                )
+            consecutive_failures = 0
+            was_failing = False
+            limit_since, limit_value = notify_limit_status(
+                config,
+                notifier,
+                controller,
+                limit_since,
+                limit_value,
+            )
         except (requests.RequestException, ValueError, KeyError) as exc:
+            consecutive_failures += 1
+            was_failing = True
             logging.warning("ciclo saltato: %s", exc)
+            if consecutive_failures >= config.notify_after_failures:
+                notifier.send(
+                    "sensor-error",
+                    "Controller caldaia: sensori non disponibili",
+                    f"{consecutive_failures} cicli consecutivi falliti. "
+                    f"Ultimo errore: {exc}",
+                    priority=4,
+                )
 
         stop_event.wait(config.interval_s)
 
@@ -184,14 +290,28 @@ def main():
         config.watts_per_duty_step,
         config.max_duty_step,
     )
+    notifier = Notifier(
+        config.notifications_enabled,
+        config.ntfy_server,
+        config.ntfy_topic,
+        config.ntfy_timeout_s,
+        config.notification_cooldown_s,
+    )
     stop_event = Event()
-    thread = Thread(target=elaborate, args=(config, controller, stop_event))
+    thread = Thread(target=elaborate, args=(config, controller, notifier, stop_event))
 
     try:
         thread.start()
         thread.join()
     except KeyboardInterrupt:
         logging.info("arresto richiesto")
+        notifier.send(
+            "shutdown",
+            "Controller caldaia arrestato",
+            f"{socket.gethostname()} ha ricevuto un arresto manuale.",
+            priority=2,
+            force=True,
+        )
         stop_event.set()
         thread.join()
     finally:
