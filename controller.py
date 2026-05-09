@@ -5,8 +5,10 @@ import logging
 import socket
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
+from zoneinfo import ZoneInfo
 
 import requests
 from dateutil import parser
@@ -37,7 +39,9 @@ class Config:
     ntfy_timeout_s: float = 3.0
     notification_cooldown_s: float = 600.0
     notify_after_failures: int = 3
-    limit_status_after_s: float = 300.0
+    status_timezone: str = "Europe/Rome"
+    status_start_hour: int = 7
+    status_end_hour: int = 21
 
 
 class Notifier:
@@ -188,32 +192,35 @@ def calculate(prod=0.0, cons=0.0, threshold=0.0, controller=None):
     return controller.update(surplus, threshold)
 
 
-def notify_limit_status(config, notifier, controller, limit_since, limit_value):
-    if controller.status not in (0.0, 100.0):
-        return None, None
+def notify_hourly_status(config, notifier, controller, prod_w, cons_w, last_status_hour):
+    now = datetime.now(ZoneInfo(config.status_timezone))
+    if not config.status_start_hour <= now.hour <= config.status_end_hour:
+        return last_status_hour
 
-    now = time.monotonic()
-    if limit_value != controller.status:
-        return now, controller.status
+    status_hour = now.strftime("%Y-%m-%d %H")
+    if status_hour == last_status_hour:
+        return last_status_hour
 
-    if limit_since is not None and now - limit_since >= config.limit_status_after_s:
-        notifier.send(
-            f"duty-limit-{int(controller.status)}",
-            "Controller caldaia: duty al limite",
-            f"PWM fermo a {controller.status:.0f}% da almeno "
-            f"{config.limit_status_after_s:.0f} secondi.",
-            priority=4,
-        )
-
-    return limit_since, limit_value
+    surplus_w = prod_w - cons_w
+    notifier.send(
+        f"hourly-status-{status_hour}",
+        "Controller caldaia: stato orario",
+        f"Valvola aperta al {controller.status:.0f}%\n"
+        f"Produzione: {prod_w:.0f} W\n"
+        f"Consumo: {cons_w:.0f} W\n"
+        f"Surplus: {surplus_w:.0f} W\n"
+        f"Ora Roma: {now.strftime('%H:%M')}",
+        priority=2,
+        force=True,
+    )
+    return status_hour
 
 
 def elaborate(config, controller, notifier, stop_event=None):
     stop_event = stop_event or Event()
     consecutive_failures = 0
     was_failing = False
-    limit_since = None
-    limit_value = None
+    last_status_hour = None
 
     notifier.send(
         "startup",
@@ -238,9 +245,11 @@ def elaborate(config, controller, notifier, stop_event=None):
                 config.request_timeout_s,
             )
             write_values(prod, cons, config.output_file)
+            prod_w = read_power(prod, "PowerL1")
+            cons_w = read_power(cons, "PowerL1")
             calculate(
-                read_power(prod, "PowerL1"),
-                read_power(cons, "PowerL1"),
+                prod_w,
+                cons_w,
                 threshold=config.control_deadband_w,
                 controller=controller,
             )
@@ -255,12 +264,13 @@ def elaborate(config, controller, notifier, stop_event=None):
                 )
             consecutive_failures = 0
             was_failing = False
-            limit_since, limit_value = notify_limit_status(
+            last_status_hour = notify_hourly_status(
                 config,
                 notifier,
                 controller,
-                limit_since,
-                limit_value,
+                prod_w,
+                cons_w,
+                last_status_hour,
             )
         except (requests.RequestException, ValueError, KeyError) as exc:
             consecutive_failures += 1
