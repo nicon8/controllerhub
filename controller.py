@@ -33,6 +33,8 @@ class Config:
     request_timeout_s: float = 3.0
     watts_per_duty_step: float = 200.0
     max_duty_step: float = 5.0
+    surplus_smoothing_alpha: float = 0.25
+    control_warmup_cycles: int = 3
     notifications_enabled: bool = True
     ntfy_server: str = "https://ntfy.sh"
     ntfy_topic: str = "controller-caldaia-castellano"
@@ -192,6 +194,12 @@ def calculate(prod=0.0, cons=0.0, threshold=0.0, controller=None):
     return controller.update(surplus, threshold)
 
 
+def smooth_surplus(previous_surplus, current_surplus, alpha):
+    if previous_surplus is None:
+        return current_surplus
+    return (alpha * current_surplus) + ((1.0 - alpha) * previous_surplus)
+
+
 def notify_hourly_status(config, notifier, controller, prod_w, cons_w, last_status_hour):
     now = datetime.now(ZoneInfo(config.status_timezone))
     if not config.status_start_hour <= now.hour <= config.status_end_hour:
@@ -221,6 +229,8 @@ def elaborate(config, controller, notifier, stop_event=None):
     consecutive_failures = 0
     was_failing = False
     last_status_hour = None
+    smoothed_surplus_w = None
+    warmup_cycles_remaining = config.control_warmup_cycles
 
     notifier.send(
         "startup",
@@ -247,12 +257,23 @@ def elaborate(config, controller, notifier, stop_event=None):
             write_values(prod, cons, config.output_file)
             prod_w = read_power(prod, "PowerL1")
             cons_w = read_power(cons, "PowerL1")
-            calculate(
-                prod_w,
-                cons_w,
-                threshold=config.control_deadband_w,
-                controller=controller,
+            raw_surplus_w = prod_w - cons_w
+            smoothed_surplus_w = smooth_surplus(
+                smoothed_surplus_w,
+                raw_surplus_w,
+                config.surplus_smoothing_alpha,
             )
+
+            if warmup_cycles_remaining > 0:
+                warmup_cycles_remaining -= 1
+                logging.info(
+                    "warmup control raw_surplus=%.1fW smoothed_surplus=%.1fW remaining=%d",
+                    raw_surplus_w,
+                    smoothed_surplus_w,
+                    warmup_cycles_remaining,
+                )
+            else:
+                controller.update(smoothed_surplus_w, config.control_deadband_w)
 
             if was_failing:
                 notifier.send(
@@ -275,6 +296,8 @@ def elaborate(config, controller, notifier, stop_event=None):
         except (requests.RequestException, ValueError, KeyError) as exc:
             consecutive_failures += 1
             was_failing = True
+            smoothed_surplus_w = None
+            warmup_cycles_remaining = config.control_warmup_cycles
             logging.warning("ciclo saltato: %s", exc)
             if consecutive_failures >= config.notify_after_failures:
                 notifier.send(
