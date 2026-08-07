@@ -24,7 +24,7 @@ class Config:
     production_device: str = "SDM1.2"
     consumption_device: str = "SDM1.1"
     use_average: bool = False
-    control_deadband_w: float = 400.0
+    control_deadband_w: float = 100.0
     interval_s: float = 5.0
     output_file: str = "/home/pi/shared/misure"
     server: str = "http://localhost:8000"
@@ -32,7 +32,8 @@ class Config:
     pwm_frequency_hz: int = 1000
     request_timeout_s: float = 3.0
     watts_per_duty_step: float = 200.0
-    max_duty_step: float = 5.0
+    max_duty_step: float = 1.5
+    direction_hold_s: float = 15.0
     surplus_smoothing_alpha: float = 0.25
     control_warmup_cycles: int = 3
     notifications_enabled: bool = True
@@ -84,10 +85,20 @@ class Notifier:
 
 
 class ValveController:
-    def __init__(self, pin, pwm_frequency_hz, watts_per_duty_step, max_duty_step):
+    def __init__(
+        self,
+        pin,
+        pwm_frequency_hz,
+        watts_per_duty_step,
+        max_duty_step,
+        direction_hold_s,
+    ):
         self.status = 0.0
         self.watts_per_duty_step = watts_per_duty_step
         self.max_duty_step = max_duty_step
+        self.direction_hold_s = direction_hold_s
+        self._last_delta = 0.0
+        self._last_change_at = None
         self._pwm = None
 
         if GPIO is None:
@@ -106,14 +117,31 @@ class ValveController:
 
     def update(self, surplus_w, deadband_w):
         if surplus_w > deadband_w:
-            delta = surplus_w / self.watts_per_duty_step
+            effective_surplus = surplus_w - deadband_w
         elif surplus_w < -deadband_w:
-            delta = surplus_w / self.watts_per_duty_step
+            effective_surplus = surplus_w + deadband_w
         else:
+            effective_surplus = 0.0
+
+        delta = effective_surplus / self.watts_per_duty_step
+        delta = max(-self.max_duty_step, min(self.max_duty_step, delta))
+
+        now = time.monotonic()
+        reversing = delta != 0 and self._last_delta != 0 and (
+            delta > 0 > self._last_delta or delta < 0 < self._last_delta
+        )
+        if (
+            reversing
+            and self._last_change_at is not None
+            and now - self._last_change_at < self.direction_hold_s
+        ):
             delta = 0.0
 
-        delta = max(-self.max_duty_step, min(self.max_duty_step, delta))
         self.status = max(0.0, min(100.0, self.status + delta))
+
+        if delta != 0:
+            self._last_delta = delta
+            self._last_change_at = now
 
         if self._pwm is not None:
             self._pwm.ChangeDutyCycle(self.status)
@@ -322,6 +350,7 @@ def main():
         config.pwm_frequency_hz,
         config.watts_per_duty_step,
         config.max_duty_step,
+        config.direction_hold_s,
     )
     notifier = Notifier(
         config.notifications_enabled,
