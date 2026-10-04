@@ -26,6 +26,14 @@ class Config:
     use_average: bool = False
     control_deadband_w: float = 100.0
     interval_s: float = 5.0
+    startup_delay_s: float = 30.0
+    measurement_interval_s: float = 1.0
+    normal_logging_interval_s: float = 5.0
+    detailed_logging_interval_s: float = 1.0
+    morning_detail_start_hour: int = 6
+    morning_detail_end_hour: int = 10
+    evening_detail_start_hour: int = 17
+    evening_detail_end_hour: int = 22
     output_file: str = "/home/pi/shared/misure"
     server: str = "http://localhost:8000"
     gpio_pin: int = 12
@@ -252,6 +260,14 @@ def notify_hourly_status(config, notifier, controller, prod_w, cons_w, last_stat
     return status_hour
 
 
+def detailed_logging_active(config):
+    hour = datetime.now(ZoneInfo(config.status_timezone)).hour
+    return (
+        config.morning_detail_start_hour <= hour <= config.morning_detail_end_hour
+        or config.evening_detail_start_hour <= hour <= config.evening_detail_end_hour
+    )
+
+
 def elaborate(config, controller, notifier, stop_event=None):
     stop_event = stop_event or Event()
     consecutive_failures = 0
@@ -259,6 +275,8 @@ def elaborate(config, controller, notifier, stop_event=None):
     last_status_hour = None
     smoothed_surplus_w = None
     warmup_cycles_remaining = config.control_warmup_cycles
+    last_control_at = None
+    last_logged_at = None
 
     notifier.send(
         "startup",
@@ -267,6 +285,10 @@ def elaborate(config, controller, notifier, stop_event=None):
         priority=2,
         force=True,
     )
+
+    logging.info("attesa avvio servizi sensori: %.0f secondi", config.startup_delay_s)
+    if stop_event.wait(config.startup_delay_s):
+        return
 
     while not stop_event.is_set():
         try:
@@ -282,7 +304,6 @@ def elaborate(config, controller, notifier, stop_event=None):
                 config.use_average,
                 config.request_timeout_s,
             )
-            write_values(prod, cons, config.output_file)
             prod_w = read_power(prod, "PowerL1")
             cons_w = read_power(cons, "PowerL1")
             raw_surplus_w = prod_w - cons_w
@@ -292,16 +313,35 @@ def elaborate(config, controller, notifier, stop_event=None):
                 config.surplus_smoothing_alpha,
             )
 
-            if warmup_cycles_remaining > 0:
-                warmup_cycles_remaining -= 1
-                logging.info(
-                    "warmup control raw_surplus=%.1fW smoothed_surplus=%.1fW remaining=%d",
-                    raw_surplus_w,
-                    smoothed_surplus_w,
-                    warmup_cycles_remaining,
-                )
-            else:
-                controller.update(smoothed_surplus_w, config.control_deadband_w)
+            now = time.monotonic()
+            control_due = (
+                last_control_at is None
+                or now - last_control_at >= config.interval_s
+            )
+            if control_due:
+                last_control_at = now
+                if warmup_cycles_remaining > 0:
+                    warmup_cycles_remaining -= 1
+                    logging.info(
+                        "warmup control raw_surplus=%.1fW smoothed_surplus=%.1fW remaining=%d",
+                        raw_surplus_w,
+                        smoothed_surplus_w,
+                        warmup_cycles_remaining,
+                    )
+                else:
+                    controller.update(smoothed_surplus_w, config.control_deadband_w)
+
+            log_interval = (
+                config.detailed_logging_interval_s
+                if detailed_logging_active(config)
+                else config.normal_logging_interval_s
+            )
+            if (
+                last_logged_at is None
+                or now - last_logged_at >= log_interval
+            ):
+                write_values(prod, cons, config.output_file)
+                last_logged_at = now
 
             if was_failing:
                 notifier.send(
@@ -336,7 +376,7 @@ def elaborate(config, controller, notifier, stop_event=None):
                     priority=4,
                 )
 
-        stop_event.wait(config.interval_s)
+        stop_event.wait(config.measurement_interval_s)
 
 
 def main():

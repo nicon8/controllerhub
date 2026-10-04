@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync ControllerHub measurements to NAS
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/home/pi/shared/misure
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/work/controllerhub
+ExecStart=/home/pi/work/controllerhub/scripts/sync_measurements.sh
